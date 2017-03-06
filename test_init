@@ -1,0 +1,93 @@
+@app.route('/api/stacks/box=<string:latmin>,<string:latmax>,<string:longmin>,<string:longmax>,startDate=<string:sdate>,endDate=<string:edate>')
+def test_rgb(latmin,latmax,longmin,longmax,sdate,edate):
+
+    latmin = float(latmin)
+    latmax = float(latmax)
+    longmin = float(longmin)
+    longmax = float(longmax)
+    dc = datacube.Datacube()
+    rgb = dc.load(product='s2a_level1c_10', longitude=(longmin, longmax), latitude=(latmin, latmax), measurements=['red', 'green', 'blue'], time=(sdate,edate))
+    
+    if not rgb.dims:
+       return as_json({
+            'nbfiles': 0,
+            'path': '' 
+        }) 
+    else: 
+        resolution = dc.list_products().resolution.values[0]
+        transform = affine.Affine(resolution[1], 0.0, min(rgb.longitude.values), 0.0, resolution[0], max(rgb.latitude.values))
+
+        timecount=0
+        identifiant=uuid.uuid4()
+        directory = '/products/Users/' + str(identifiant) + '/' 
+        os.mkdir(directory) 
+        pid = os.fork()
+        if pid != 0:
+			#recupere images du datacube et sauvegarde dans tif
+            for date in rgb.time.time.values:
+                new_dataset = rasterio.open(directory+str(date)[:13]+'-'+str(date)[14:16]+'-'+str(date)[17:19]+'.tif', 'w', driver = 'Gtiff',
+                               height=rgb.red.shape[1], width=rgb.red.shape[2],
+                               count =3, dtype=rgb.red.dtype, crs='EPSG:4326',
+                               transform = transform, nodata=-999)
+                new_dataset.write(rgb.red.isel(time=timecount).values,1)
+                new_dataset.write(rgb.green.isel(time=timecount).values,2)
+                new_dataset.write(rgb.blue.isel(time=timecount).values,3)
+                new_dataset.close()
+                timecount += 1
+				
+				#transforme les tif (en 16 bit) en jpg 8 bit
+                img = cv2.imread(directory+str(date)[:13]+'-'+str(date)[14:16]+'-'+str(date)[17:19]+'.tif', cv2.IMREAD_ANYDEPTH | 1)
+                rows,cols,channels = img.shape
+                img = np.where(img < [64537,64537,64537], img, np.nan) 
+                blue = img[:,:,0]
+                green = img[:,:,1]
+                red = img[:,:,2]
+                seuil = nth_elem(blue,0.99)
+                b = np.where(np.isnan(blue) | (blue <= seuil), blue, seuil)
+
+                seuil = nth_elem(green,0.99)
+                g = np.where(np.isnan(green) | (green <= seuil), green, seuil)
+
+                seuil = nth_elem(red,0.99)
+                r = np.where(np.isnan(red) | (red <= seuil), red, seuil)
+
+                img[:,:,0] = b
+                img[:,:,1] = g
+                img[:,:,2] = r
+                maxi = np.nanmax(img)
+                mini = np.nanmin(img)
+                b = np.subtract(b, mini)
+                g = np.subtract(g, mini)
+                r = np.subtract(r, mini)
+
+                denum = float(maxi-mini)
+                b = np.divide(b, denum)
+                g = np.divide(g, denum)
+                r = np.divide(r, denum)
+
+                b = np.multiply(b, 255)
+                g = np.multiply(g, 255)
+                r = np.multiply(r, 255)
+
+                img[:,:,0] = b
+                img[:,:,1] = g
+                img[:,:,2] = r
+
+                img = img.astype(np.uint8, copy=False)
+                cv2.imwrite(directory+str(date)[:13]+'-'+str(date)[14:16]+'-'+str(date)[17:19]+'_8bibts.jpg',img)
+    
+			#creer dossier ou sont stockees les requetes utilisateurs
+            os.chdir(directory)
+			#utilisation library imagemagik de linux pour convertir les jpg en gif anime
+            os.system('convert -delay 90 -loop 0 *.jpg time_series.gif')
+			#cmd linux de suppr  des jpg
+            os.system('rm *.jpg')
+			#arret du subprocess (lance par fork)
+            os.wait()
+			#message du processus fils pour annoncer la fin de son traitement (json bidon)
+            return as_json({}) 
+        else :
+            return as_json({
+                'nbfiles': rgb.dims['time'],
+                'path': directory
+            })
